@@ -1,59 +1,109 @@
 import tkinter as tk
 from tkinter import messagebox
 import pika
-from criptografia import encrypt_AES, encrypt_DES, encrypt_RSA, generate_RSA_keys
+from criptografia import (
+    encrypt_AES, encrypt_DES, encrypt_RSA,
+    generate_RSA_keys as generate_encryption_keys, 
+    generate_persistent_signing_keys,
+    sign_message_RSA
+)
 from config import AES_KEY, DES_KEY, RABBITMQ_HOST, RABBITMQ_QUEUE, PRIVATE_KEY_PATH
+
+PRODUCER_NAME = "Manu"
+SIGNING_PRIVATE_KEY_PATH = 'producer_signing_private.pem'
+SIGNING_PUBLIC_KEY_PATH = 'producer_signing_public.pem'
 
 class ProducerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Produtor - Enviar Mensagem Criptografada")
-        self.algorithm = tk.StringVar(value="AES")
+        self.root.title("Produtor - Criptografar e Assinar")
         
-        tk.Label(root, text="Digite o texto:").pack()
-        self.text_entry = tk.Entry(root, width=50)
-        self.text_entry.pack()
+        self.signing_private_key = None
+        self.signing_public_key_pem_str = None
 
-        tk.Label(root, text="Escolha o algoritmo:").pack()
+        try:
+            with open(SIGNING_PRIVATE_KEY_PATH, "rb") as f:
+                self.signing_private_key = f.read() # Bytes
+            with open(SIGNING_PUBLIC_KEY_PATH, "rb") as f:
+                self.signing_public_key_pem_str = f.read().decode() # String
+        except FileNotFoundError:
+            try:
+                public_key_bytes, private_key_bytes = generate_persistent_signing_keys()
+                self.signing_private_key = private_key_bytes
+                self.signing_public_key_pem_str = public_key_bytes.decode()
+                messagebox.showinfo("Chaves de Assinatura", "Novas chaves de assinatura foram geradas e salvas.")
+            except Exception as e:
+                messagebox.showerror("Erro Crítico", f"Falha ao gerar chaves de assinatura: {e}")
+                if self.root.winfo_exists(): self.root.destroy()
+                return
+        except Exception as e:
+            messagebox.showerror("Erro Crítico", f"Falha ao carregar chaves de assinatura: {e}")
+            if self.root.winfo_exists(): self.root.destroy()
+            return
+        
+        if not self.root.winfo_exists(): return
+
+        self.algorithm_var = tk.StringVar(value="AES")
+        
+        tk.Label(self.root, text="Mensagem:").pack()
+        self.message_entry = tk.Entry(self.root, width=50)
+        self.message_entry.pack()
+
+        tk.Label(self.root, text="Algoritmo de Criptografia:").pack()
         for alg in ["AES", "DES", "RSA"]:
-            tk.Radiobutton(root, text=alg, variable=self.algorithm, value=alg).pack(anchor="w")
+            tk.Radiobutton(self.root, text=alg, variable=self.algorithm_var, value=alg).pack(anchor="w")
 
-        tk.Button(root, text="Enviar Mensagem", command=self.send_message).pack(pady=10)
-        self.encrypted_label = tk.Label(root, text="Mensagem criptografada: ")
-        self.encrypted_label.pack()
+        tk.Button(self.root, text="Enviar Mensagem Assinada", command=self.process_and_send).pack(pady=10)
+        self.info_label = tk.Label(self.root, text="Status: Pronto")
+        self.info_label.pack()
 
-    def send_message(self):
-        message = self.text_entry.get()
-        algoritmo = self.algorithm.get()
-
-        if not message:
-            messagebox.showwarning("Aviso", "Digite uma mensagem.")
+    def process_and_send(self):
+        if not self.signing_private_key:
+            messagebox.showerror("Erro", "Chave de assinatura não disponível.")
             return
 
-        if algoritmo == 'AES':
-            encrypted = encrypt_AES(message, AES_KEY)
-        elif algoritmo == 'DES':
-            encrypted = encrypt_DES(message, DES_KEY)
-        elif algoritmo == 'RSA':
-            public_key, private_key = generate_RSA_keys()
-            encrypted = encrypt_RSA(message, public_key)
+        original_message = self.message_entry.get()
+        encryption_algorithm = self.algorithm_var.get()
+
+        if not original_message:
+            messagebox.showwarning("Atenção", "Por favor, digite uma mensagem.")
+            return
+
+        encrypted_content = ""
+        if encryption_algorithm == 'AES':
+            encrypted_content = encrypt_AES(original_message, AES_KEY)
+        elif encryption_algorithm == 'DES':
+            encrypted_content = encrypt_DES(original_message, DES_KEY)
+        elif encryption_algorithm == 'RSA':
+            enc_pub_key, enc_priv_key = generate_encryption_keys()
+            encrypted_content = encrypt_RSA(original_message, enc_pub_key)
             with open(PRIVATE_KEY_PATH, "wb") as f:
-                f.write(private_key)
+                f.write(enc_priv_key)
         else:
-            messagebox.showerror("Erro", "Algoritmo inválido.")
+            messagebox.showerror("Erro", "Algoritmo de criptografia não selecionado ou inválido.")
             return
 
-        self.encrypted_label.config(text=f"Criptografado: {encrypted}")
+        self.info_label.config(text=f"Criptografado: {encrypted_content[:30]}...")
 
-        connection = pika.BlockingConnection(pika.ConnectionParameters(RABBITMQ_HOST))
-        channel = connection.channel()
-        channel.queue_declare(queue=RABBITMQ_QUEUE)
-        channel.basic_publish(exchange='', routing_key=RABBITMQ_QUEUE, body=f"{algoritmo}|{encrypted}")
-        connection.close()
+        data_to_sign_str = f"{encryption_algorithm}|{PRODUCER_NAME}|{encrypted_content}"
+        signature = sign_message_RSA(data_to_sign_str, self.signing_private_key)
 
-        messagebox.showinfo("Sucesso", "Mensagem enviada com sucesso!")
+        message_to_send = f"{encryption_algorithm}|{PRODUCER_NAME}|{encrypted_content}|{signature}|{self.signing_public_key_pem_str}"
+
+        try:
+            connection = pika.BlockingConnection(pika.ConnectionParameters(RABBITMQ_HOST))
+            channel = connection.channel()
+            channel.queue_declare(queue=RABBITMQ_QUEUE)
+            channel.basic_publish(exchange='', routing_key=RABBITMQ_QUEUE, body=message_to_send)
+            connection.close()
+            messagebox.showinfo("Sucesso", "Mensagem criptografada e assinada foi enviada!")
+            self.info_label.config(text="Status: Mensagem enviada.")
+        except Exception as e:
+            messagebox.showerror("Erro RabbitMQ", f"Não foi possível enviar a mensagem: {e}")
+            self.info_label.config(text="Status: Falha no envio.")
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = ProducerApp(root)
-    root.mainloop()
+    gui_root = tk.Tk()
+    app_instance = ProducerApp(gui_root)
+    if gui_root.winfo_exists():
+        gui_root.mainloop()
